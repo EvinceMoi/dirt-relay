@@ -1,18 +1,5 @@
-use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket}, process::exit};
 use clap::{App, Arg};
-
-struct Endpoint {
-    addr: SocketAddr,
-    ts: u64,
-}
-
-fn timestamp() -> u64 {
-    let now = SystemTime::now();
-    let since_epoch = now.duration_since(UNIX_EPOCH).unwrap();
-    return since_epoch.as_secs();
-}
 
 fn main() {
     let opts = App::new("dirt telemetry relay")
@@ -26,14 +13,41 @@ fn main() {
             .short("p").long("port").value_name("PORT")
             .help("bind port")
             .takes_value(true).default_value("31000"))
+        .arg(Arg::with_name("group")
+            .short("g").long("group").value_name("group")
+            .help("multicast group")
+            .takes_value(true).default_value("239.10.9.8"))
         .get_matches();
     
     let port = opts.value_of("port").unwrap();
     let source = opts.value_of("source").unwrap();
-    
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", port)).unwrap();
+    let group = opts.value_of("group").unwrap();
+    println!("port: {}, source: {}, group: {}", port, source, group);
 
-    let mut subs: HashMap<String, Endpoint> = HashMap::new();
+    let group_addr = match group.parse::<IpAddr>() {
+        Ok(addr) => addr,
+        Err(err) => {
+            println!("group address error: {}", err);
+            exit(1);
+        }
+    };
+    if !group_addr.is_multicast() {
+        println!("group must be a valid multicast address");
+        exit(1);
+    }
+
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", port)).unwrap();
+    socket.set_broadcast(true).unwrap();
+    socket.set_multicast_ttl_v4(64).unwrap();
+    if group_addr.is_ipv4() {
+        socket.set_multicast_loop_v4(false).expect("failed to set_multicast_loop_v4(false)");
+    } else {
+        socket.set_multicast_loop_v6(false).expect("failed to set_multicast_loop_v6(false)");
+    }
+
+    let to_addrs = SocketAddr::new(group_addr, port.parse::<u16>().unwrap()).to_socket_addrs().unwrap();
+    let to_addr = to_addrs.clone().next().unwrap();
+    println!("to_addr: {}", to_addr);
 
     loop {
         let mut buf = [0; 576];
@@ -47,36 +61,34 @@ fn main() {
 
         let buf = &mut buf[..amt];
 
-        let ip = addr.ip().to_string();
-        if ip.ne(source) || amt == 1 {
-            let now = timestamp();
-            let src_addr = addr.to_string();
-            if subs.contains_key(&src_addr) {
-                let endp = subs.get_mut(&src_addr).unwrap();
-                endp.ts = now;
-            } else {
-                let endp = Endpoint {
-                    addr: addr,
-                    ts: now,
-                };
-                subs.insert(src_addr, endp);
-                println!("new connection from: {}", addr);
-            }
+        if amt == 1 && buf[0] == 0x2A { 
+            // sub, reply multicast addr
+            println!("sub from {}", addr);
+            let mut remote_ip = match addr.ip() {
+                IpAddr::V4(ip) => ip.octets().to_vec(),
+                IpAddr::V6(ip) => ip.octets().to_vec(),
+            };
+            let mut gaddr = match group_addr {
+                IpAddr::V4(ip) => ip.octets().to_vec(),
+                IpAddr::V6(ip) => ip.octets().to_vec(),
+            };
+            let mut data = vec![gaddr.len() as u8];
+            data.append(&mut gaddr);
+
+            data.push(remote_ip.len() as u8);
+            data.append(&mut remote_ip);
+
+            socket.send_to(data.as_ref(), addr).unwrap();
             continue;
-        }
-
-        // broadcast
-        let now = timestamp();
-        subs.retain(|_ , endp| {
-            let interval = now - endp.ts;
-            interval < 10
-        });
-
-        for endp in subs.values() {
-            socket.send_to(buf, endp.addr).unwrap_or_else(|err| {
-                println!("send error: {}", err);
-                0
-            });
+        } else if addr.ip().to_string().eq(source) {
+            // multicast
+            match socket.send_to(buf, to_addr) {
+                Ok(s) => s,
+                Err(err) => {
+                    println!("send_to {} error: {}", to_addr, err);
+                    0
+                }
+            };
         }
     }
 }
